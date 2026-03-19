@@ -1,73 +1,82 @@
 from typing import List, Set, Tuple, FrozenSet
 
-# Type alias for a Functional Dependency: (LHS, RHS)
 FD = Tuple[FrozenSet[str], FrozenSet[str]]
 
 
 def is_lossless_decomposition(
     original_attrs: Set[str], decomposed_schemas: List[Set[str]], fds: List[FD]
 ) -> bool:
-    """
-    Determines whether the decomposition is lossless using the Chase algorithm.
-
-    Args:
-        original_attrs (Set[str]): Set of all attributes in the original relation.
-        decomposed_schemas (List[Set[str]]): List of sets, each representing attributes in a decomposed schema.
-        fds (List[FD]): List of functional dependencies, each as (LHS, RHS) where both are frozen sets.
-
-    Returns:
-        bool: True if the decomposition is lossless, False otherwise.
-    """
     if not original_attrs or not decomposed_schemas or not fds:
-        print("Lossless Check Error: Missing inputs (attributes/schemas/fds)")
+        print("Lossless Check Error: Missing inputs")
         return False
 
-    # Initialize tableau: { attribute : set of symbols (a_i or b_i_attr) }
-    tableau = {attr: set() for attr in original_attrs}
+    attrs = sorted(original_attrs)
+    n = len(decomposed_schemas)
+
+    # ✅ Tableau is a list of rows (one row per decomposed schema)
+    # Each row is a dict: attribute → symbol
+    # a_j means "distinguished symbol" (this schema contains this attr)
+    # b_i_j means "non-distinguished symbol"
+    tableau = []
     for i, schema in enumerate(decomposed_schemas):
-        for attr in original_attrs:
+        row = {}
+        for j, attr in enumerate(attrs):
             if attr in schema:
-                tableau[attr].add(f"a{i}")
+                row[attr] = f"a_{j}"  # distinguished
             else:
-                tableau[attr].add(f"b{i}_{attr}")
+                row[attr] = f"b_{i}_{j}"  # non-distinguished
+        tableau.append(row)
 
-    # Debug: Initial tableau
     print("\nInitial Tableau:")
-    for attr in tableau:
-        print(f"  {attr}: {tableau[attr]}")
+    for i, row in enumerate(tableau):
+        print(f"  Row {i}: {row}")
 
+    # ✅ Apply FDs: if two rows agree on LHS, make them agree on RHS
     changed = True
     while changed:
         changed = False
         for lhs, rhs in fds:
-            if not lhs:
-                continue
+            # Check all pairs of rows
+            for i in range(n):
+                for k in range(n):
+                    if i == k:
+                        continue
 
-            try:
-                # Common values across all tableau rows for LHS attributes
-                common_rows = set.intersection(*[tableau[attr] for attr in lhs])
-            except KeyError as e:
-                print(f"Attribute {e} in FD LHS not found in tableau")
-                continue
+                    # Do rows i and k agree on all LHS attributes?
+                    lhs_agree = all(
+                        tableau[i].get(attr) == tableau[k].get(attr)
+                        for attr in lhs
+                        if attr in attrs
+                    )
 
-            for attr in rhs:
-                if attr not in tableau:
-                    continue
-                before = tableau[attr].copy()
-                tableau[attr].update(common_rows)
-                if tableau[attr] != before:
-                    changed = True
+                    if lhs_agree:
+                        # Make them agree on RHS — prefer distinguished symbol
+                        for attr in rhs:
+                            if attr not in attrs:
+                                continue
+                            si = tableau[i].get(attr)
+                            sk = tableau[k].get(attr)
+                            if si != sk:
+                                # Pick distinguished (a_j) over non-distinguished
+                                if si and si.startswith("a_"):
+                                    if tableau[k][attr] != si:
+                                        tableau[k][attr] = si
+                                        changed = True
+                                elif sk and sk.startswith("a_"):
+                                    if tableau[i][attr] != sk:
+                                        tableau[i][attr] = sk
+                                        changed = True
 
-    # Debug: Final tableau
-    print("\nFinal Tableau After Chase:")
-    for attr in tableau:
-        print(f"  {attr}: {tableau[attr]}")
+    print("\nFinal Tableau:")
+    for i, row in enumerate(tableau):
+        print(f"  Row {i}: {row}")
 
-    # Lossless if any a_i appears in all rows
-    for i in range(len(decomposed_schemas)):
-        if all(f"a{i}" in tableau[attr] for attr in original_attrs):
-            print(f"\nLossless decomposition confirmed via row a{i}.")
+    # ✅ Lossless if any row is all distinguished symbols (all a_j)
+    distinguished = {attr: f"a_{j}" for j, attr in enumerate(attrs)}
+    for i, row in enumerate(tableau):
+        if all(row.get(attr) == distinguished[attr] for attr in attrs):
+            print(f"\n✅ Lossless confirmed via row {i}")
             return True
 
-    print("\nLossless decomposition FAILED.")
+    print("\n❌ Lossless check FAILED")
     return False
