@@ -1,0 +1,8 @@
+flask
+flask-cors
+pandas
+graphviz
+openpyxl
+xlrd
+numpy
+werkzeug

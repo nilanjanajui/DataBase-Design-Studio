@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dds_backend
+    environment:
+      - FLASK_DEBUG=false        # Set to "true" only for local debugging
+    ports:
+      - "5000:5000"              # Direct Flask access if needed
+    volumes:
+      - ./backend/processed:/app/processed   # Persist normalized table CSVs
+      - ./backend/uploads:/app/uploads       # Persist uploaded files
+    restart: unless-stopped
+    networks:
+      - dds_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: dds_frontend
+    ports:
+      - "80:80"                  # App accessible at http://localhost
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - dds_network
+
+networks:
+  dds_network:
+    driver: bridge
