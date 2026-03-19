@@ -1,11 +1,13 @@
 import os
 import json
 import re
+import uuid
+import shutil
+import time
 from flask import Flask, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 import pandas as pd
-from io import BytesIO
 from typing import List, Dict, Set, Tuple, FrozenSet
 
 from convert_to_csv import convert_to_csv
@@ -28,8 +30,6 @@ from er_diagram import generate_er_diagram_from_keymap
 
 app = Flask(__name__)
 
-# ✅ FIX: Added Docker origins (http://localhost, http://localhost:80)
-# Previously only had port 3000 which is React dev server — breaks in Docker (Nginx runs on port 80)
 CORS(
     app,
     resources={
@@ -39,22 +39,65 @@ CORS(
                 "http://127.0.0.1:3000",
                 "http://localhost",
                 "https://dbms-backend-nj4r.onrender.com",
-                "https://database-design-studio.netlify.app",  # ← your netlify URL
+                "https://database-design-studio.netlify.app",
             ],
             "methods": ["GET", "POST", "PUT", "DELETE"],
-            "allow_headers": ["Content-Type", "Authorization"],
+            "allow_headers": ["Content-Type", "Authorization", "X-Session-ID"],
         }
     },
 )
 app.secret_key = "your-secret-key"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-PROCESSED_FOLDER = os.path.join(BASE_DIR, "processed")
+SESSIONS_FOLDER = os.path.join(BASE_DIR, "sessions")
 CODE_FOLDER = BASE_DIR
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+os.makedirs(SESSIONS_FOLDER, exist_ok=True)
+
+# Sessions expire after 2 hours
+SESSION_EXPIRY_SECONDS = 2 * 60 * 60
+
+
+# ─────────────────────────────────────────
+# Session Helpers
+# ─────────────────────────────────────────
+
+
+def get_session_id():
+    """Get session ID from request header."""
+    return request.headers.get("X-Session-ID")
+
+
+def get_session_folders(session_id):
+    """Return upload + processed folder paths for this session."""
+    session_dir = os.path.join(SESSIONS_FOLDER, session_id)
+    upload_folder = os.path.join(session_dir, "uploads")
+    processed_folder = os.path.join(session_dir, "processed")
+    os.makedirs(upload_folder, exist_ok=True)
+    os.makedirs(processed_folder, exist_ok=True)
+    return upload_folder, processed_folder
+
+
+def cleanup_old_sessions():
+    """Delete session folders older than SESSION_EXPIRY_SECONDS."""
+    now = time.time()
+    if not os.path.exists(SESSIONS_FOLDER):
+        return
+    for sid in os.listdir(SESSIONS_FOLDER):
+        session_path = os.path.join(SESSIONS_FOLDER, sid)
+        try:
+            if os.path.isdir(session_path):
+                age = now - os.path.getmtime(session_path)
+                if age > SESSION_EXPIRY_SECONDS:
+                    shutil.rmtree(session_path)
+                    print(f"✓ Cleaned expired session: {sid}")
+        except Exception as e:
+            print(f"✗ Cleanup error for {sid}: {e}")
+
+
+# ─────────────────────────────────────────
+# Merge Numbered Columns Helper
+# ─────────────────────────────────────────
 
 
 def merge_numbered_columns(df: pd.DataFrame, join_delimiter: str = ",") -> pd.DataFrame:
@@ -70,7 +113,6 @@ def merge_numbered_columns(df: pd.DataFrame, join_delimiter: str = ",") -> pd.Da
     for base, cols in grouped_cols.items():
         if len(cols) <= 1:
             continue
-
         base_col_name = base.replace(" ", "_")
 
         def merge_row_values(row):
@@ -84,88 +126,66 @@ def merge_numbered_columns(df: pd.DataFrame, join_delimiter: str = ",") -> pd.Da
             return join_delimiter.join(values) if values else ""
 
         df[base_col_name] = df.apply(merge_row_values, axis=1)
-
         if df[base_col_name].apply(lambda x: x == "" or pd.isna(x)).all():
             df.drop(columns=[base_col_name], inplace=True)
-
         df.drop(columns=cols, inplace=True)
 
     return df
 
 
+# ─────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────
+
+
 @app.route("/api/upload", methods=["POST"])
 def upload_file():
     try:
-        print("=== UPLOAD DEBUG START ===")
-        print(f"Request method: {request.method}")
-        print(f"Request content type: {request.content_type}")
-        print(f"Request files: {request.files}")
+        cleanup_old_sessions()
 
         if "file" not in request.files:
-            print("✗ No 'file' in request.files")
             return jsonify({"message": "No file part in request"}), 400
 
         file = request.files["file"]
-        print(f"File received: {file}")
-        print(f"File filename: {file.filename}")
-        print(f"File content type: {file.content_type}")
-
         if file.filename == "":
-            print("✗ Empty filename")
             return jsonify({"message": "No file selected"}), 400
 
-        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-        print(f"Upload folder: {UPLOAD_FOLDER}")
-        print(f"Upload folder exists: {os.path.exists(UPLOAD_FOLDER)}")
+        # ✅ New unique session per upload
+        session_id = str(uuid.uuid4())
+        upload_folder, _ = get_session_folders(session_id)
 
         filename = secure_filename(file.filename)
-        file_path = os.path.join(UPLOAD_FOLDER, filename)
-        print(f"Saving to: {file_path}")
-
+        file_path = os.path.join(upload_folder, filename)
         file.save(file_path)
 
         if os.path.exists(file_path):
             file_size = os.path.getsize(file_path)
-            print(f"✓ File saved successfully: {file_size} bytes")
-
-            upload_files = os.listdir(UPLOAD_FOLDER)
-            print(f"Files in upload folder: {upload_files}")
-
+            print(f"✓ Saved: {filename} | Session: {session_id}")
             return jsonify(
                 {
                     "message": "File uploaded successfully",
                     "filename": filename,
                     "size": file_size,
+                    "session_id": session_id,  # ✅ Frontend stores this
                 }
             )
         else:
-            print("✗ File save verification failed")
             return jsonify({"message": "File save failed"}), 500
 
     except Exception as e:
-        print(f"✗ Upload error: {str(e)}")
         import traceback
 
         traceback.print_exc()
         return jsonify({"message": f"Upload failed: {str(e)}"}), 500
 
-    finally:
-        print("=== UPLOAD DEBUG END ===")
-
 
 @app.route("/api/debug", methods=["GET"])
 def debug_info():
+    sessions = os.listdir(SESSIONS_FOLDER) if os.path.exists(SESSIONS_FOLDER) else []
     return jsonify(
         {
             "status": "Backend is running",
-            "upload_folder": UPLOAD_FOLDER,
-            "upload_folder_exists": os.path.exists(UPLOAD_FOLDER),
-            "files_in_upload": (
-                os.listdir(UPLOAD_FOLDER) if os.path.exists(UPLOAD_FOLDER) else []
-            ),
-            "processed_folder": PROCESSED_FOLDER,
-            "processed_folder_exists": os.path.exists(PROCESSED_FOLDER),
-            "backend_url": "http://localhost:5000",
+            "total_active_sessions": len(sessions),
         }
     )
 
@@ -173,20 +193,20 @@ def debug_info():
 @app.route("/api/convert_to_csv", methods=["POST"])
 def api_convert_to_csv():
     try:
-        files = os.listdir(UPLOAD_FOLDER)
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"message": "No session ID provided"}), 400
+
+        upload_folder, processed_folder = get_session_folders(session_id)
+        files = os.listdir(upload_folder)
         if not files:
             return jsonify({"message": "No uploaded files found"}), 400
 
-        file_path = os.path.join(UPLOAD_FOLDER, files[0])
-
-        from convert_to_csv import convert_to_csv
-
-        csv_path, df = convert_to_csv(file_path, output_folder=PROCESSED_FOLDER)
-
-        print(f"✓ Conversion successful: {csv_path}")
+        file_path = os.path.join(upload_folder, files[0])
+        csv_path, df = convert_to_csv(file_path, output_folder=processed_folder)
+        print(f"✓ Converted: {csv_path}")
         return jsonify({"message": "File converted to CSV"})
     except Exception as e:
-        print(f"✗ Conversion error: {str(e)}")
         import traceback
 
         traceback.print_exc()
@@ -196,18 +216,23 @@ def api_convert_to_csv():
 @app.route("/api/clean_modify", methods=["POST"])
 def api_clean_modify():
     try:
-        files = [f for f in os.listdir(PROCESSED_FOLDER) if f.endswith(".csv")]
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"message": "No session ID provided"}), 400
+
+        _, processed_folder = get_session_folders(session_id)
+        files = [f for f in os.listdir(processed_folder) if f.endswith(".csv")]
         if not files:
             return jsonify({"message": "No CSV files found to clean"}), 400
 
-        file_path = os.path.join(PROCESSED_FOLDER, files[0])
-        df = pd.read_csv(file_path, encoding="utf-8")
+        df = pd.read_csv(os.path.join(processed_folder, files[0]), encoding="utf-8")
         cleaned_df = clean_dataset(df)
         cleaned_df = merge_numbered_columns(cleaned_df)
-
-        cleaned_path = os.path.join(PROCESSED_FOLDER, f"cleaned_{files[0]}")
-        cleaned_df.to_csv(cleaned_path, index=False, encoding="utf-8")
-
+        cleaned_df.to_csv(
+            os.path.join(processed_folder, f"cleaned_{files[0]}"),
+            index=False,
+            encoding="utf-8",
+        )
         return jsonify({"message": "Data cleaned, merged numbered columns, and saved"})
     except Exception as e:
         return jsonify({"message": str(e)}), 500
@@ -216,9 +241,14 @@ def api_clean_modify():
 @app.route("/api/fd_modified", methods=["POST"])
 def api_fd_modified():
     try:
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"message": "No session ID provided"}), 400
+
+        _, processed_folder = get_session_folders(session_id)
         files = [
             f
-            for f in os.listdir(PROCESSED_FOLDER)
+            for f in os.listdir(processed_folder)
             if f.startswith("cleaned_") and f.endswith(".csv")
         ]
         if not files:
@@ -227,12 +257,12 @@ def api_fd_modified():
                 400,
             )
 
-        file_path = os.path.join(PROCESSED_FOLDER, files[0])
-        df = pd.read_csv(file_path, encoding="utf-8")
-
+        df = pd.read_csv(os.path.join(processed_folder, files[0]), encoding="utf-8")
         fds = detect_functional_dependencies(df)
-        fd_file_path = os.path.join(PROCESSED_FOLDER, "detected_fds.json")
-        with open(fd_file_path, "w", encoding="utf-8") as f:
+
+        with open(
+            os.path.join(processed_folder, "detected_fds.json"), "w", encoding="utf-8"
+        ) as f:
             json.dump([{"lhs": list(lhs), "rhs": list(rhs)} for lhs, rhs in fds], f)
 
         return jsonify({"message": "Functional Dependencies detected"})
@@ -243,9 +273,14 @@ def api_fd_modified():
 @app.route("/api/key_detection", methods=["POST"])
 def api_key_detection():
     try:
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"message": "No session ID provided"}), 400
+
+        _, processed_folder = get_session_folders(session_id)
         files = [
             f
-            for f in os.listdir(PROCESSED_FOLDER)
+            for f in os.listdir(processed_folder)
             if f.startswith("cleaned_") and f.endswith(".csv")
         ]
         if not files:
@@ -254,11 +289,10 @@ def api_key_detection():
                 400,
             )
 
-        file_path = os.path.join(PROCESSED_FOLDER, files[0])
-        df = pd.read_csv(file_path, encoding="utf-8")
+        df = pd.read_csv(os.path.join(processed_folder, files[0]), encoding="utf-8")
 
         with open(
-            os.path.join(PROCESSED_FOLDER, "detected_fds.json"), "r", encoding="utf-8"
+            os.path.join(processed_folder, "detected_fds.json"), "r", encoding="utf-8"
         ) as f:
             raw_fds = [
                 (frozenset(fd["lhs"]), frozenset(fd["rhs"])) for fd in json.load(f)
@@ -267,12 +301,11 @@ def api_key_detection():
         keys = detect_keys(df, raw_fds)
 
         with open(
-            os.path.join(PROCESSED_FOLDER, "candidate_keys.json"), "w", encoding="utf-8"
+            os.path.join(processed_folder, "candidate_keys.json"), "w", encoding="utf-8"
         ) as f:
             json.dump(keys["candidate_keys"], f)
 
         return jsonify({"message": "Keys detected", "keys": keys})
-
     except Exception as e:
         return jsonify({"message": str(e)}), 500
 
@@ -283,9 +316,14 @@ FD = Tuple[FrozenSet[str], FrozenSet[str]]
 @app.route("/api/normalize_table", methods=["POST"])
 def api_normalize_table():
     try:
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"message": "No session ID provided"}), 400
+
+        _, processed_folder = get_session_folders(session_id)
         files = [
             f
-            for f in os.listdir(PROCESSED_FOLDER)
+            for f in os.listdir(processed_folder)
             if f.startswith("cleaned_") and f.endswith(".csv")
         ]
         if not files:
@@ -293,15 +331,15 @@ def api_normalize_table():
                 jsonify({"message": "No cleaned CSV file found for normalization"}),
                 400,
             )
-        filename = files[0]
 
         cleaned_df = pd.read_csv(
-            os.path.join(PROCESSED_FOLDER, filename), encoding="utf-8"
+            os.path.join(processed_folder, files[0]), encoding="utf-8"
         )
 
-        fd_path = os.path.join(PROCESSED_FOLDER, "detected_fds.json")
+        fd_path = os.path.join(processed_folder, "detected_fds.json")
         if not os.path.exists(fd_path):
             return jsonify({"message": "Detected FDs not found"}), 400
+
         with open(fd_path, "r", encoding="utf-8") as f:
             raw_fds = [
                 (frozenset(fd["lhs"]), frozenset(fd["rhs"])) for fd in json.load(f)
@@ -313,21 +351,15 @@ def api_normalize_table():
             return jsonify({"message": "No candidate keys found"}), 400
 
         df_1nf = normalize_to_1nf(cleaned_df)
-        path_1nf = os.path.join(PROCESSED_FOLDER, "1NF_table.csv")
-        df_1nf.to_csv(path_1nf, index=False)
+        df_1nf.to_csv(os.path.join(processed_folder, "1NF_table.csv"), index=False)
 
         minimized_fds = minimize_fds(raw_fds)
-        tables_2nf, remaining_fds_2nf, _ = normalize_to_2nf(
-            df_1nf, minimized_fds, candidate_keys
-        )
+        tables_2nf, _, _ = normalize_to_2nf(df_1nf, minimized_fds, candidate_keys)
         for i, tbl in enumerate(tables_2nf, start=1):
-            path_2nf = os.path.join(PROCESSED_FOLDER, f"2NF_table{i}.csv")
-            tbl.to_csv(path_2nf, index=False)
+            tbl.to_csv(os.path.join(processed_folder, f"2NF_table{i}.csv"), index=False)
 
         norm_result = full_normalization(cleaned_df, raw_fds, candidate_keys)
-        original_3nf_tables = norm_result["3NF_tables"]
-
-        tables_to_merge = [(name, df) for name, df in original_3nf_tables.items()]
+        tables_to_merge = [(name, df) for name, df in norm_result["3NF_tables"].items()]
         merged_tables = merge_normalized_tables(tables_to_merge)
 
         existing_primary_keys = {}
@@ -352,11 +384,13 @@ def api_normalize_table():
             )
 
         for table_name, table_df in merged_tables.items():
-            path = os.path.join(PROCESSED_FOLDER, f"{table_name}.csv")
-            table_df.to_csv(path, index=False)
+            table_df.to_csv(
+                os.path.join(processed_folder, f"{table_name}.csv"), index=False
+            )
 
-        keymap_path = os.path.join(PROCESSED_FOLDER, "keymap.json")
-        with open(keymap_path, "w", encoding="utf-8") as f:
+        with open(
+            os.path.join(processed_folder, "keymap.json"), "w", encoding="utf-8"
+        ) as f:
             json.dump(keymap, f, indent=2)
 
         return jsonify(
@@ -365,7 +399,6 @@ def api_normalize_table():
                 "3nf_tables": list(merged_tables.keys()),
             }
         )
-
     except Exception as e:
         return jsonify({"message": str(e)}), 500
 
@@ -373,14 +406,11 @@ def api_normalize_table():
 def get_foreign_keys(current_table, current_columns, all_primary_keys):
     foreign_keys = {}
     curr_cols_lower = {col.lower(): col for col in current_columns}
-
     for other_table, pk_list in all_primary_keys.items():
         if other_table == current_table or not pk_list:
             continue
-        pk_set = set(pk_list)
-        if not pk_set.issubset(set(current_columns)):
+        if not set(pk_list).issubset(set(current_columns)):
             continue
-
         for pk_attr in pk_list:
             pk_lower = pk_attr.lower()
             for col_lower, col_original in curr_cols_lower.items():
@@ -400,18 +430,22 @@ def get_foreign_keys(current_table, current_columns, all_primary_keys):
 @app.route("/api/generate_er_diagram", methods=["POST"])
 def api_generate_er_diagram():
     try:
-        keymap_path = os.path.join(PROCESSED_FOLDER, "keymap.json")
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"message": "No session ID provided"}), 400
+
+        _, processed_folder = get_session_folders(session_id)
+        keymap_path = os.path.join(processed_folder, "keymap.json")
         if not os.path.exists(keymap_path):
             return jsonify({"message": "Keymap JSON file not found"}), 400
 
         with open(keymap_path, "r", encoding="utf-8") as f:
             keymap = json.load(f)
 
-        base_name = "ER_Diagram"
-        image_data = generate_er_diagram_from_keymap(base_name, keymap)
-
-        er_image_path = os.path.join(PROCESSED_FOLDER, f"{base_name}.png")
-        with open(er_image_path, "wb") as img_file:
+        image_data = generate_er_diagram_from_keymap(
+            "ER_Diagram", keymap, processed_folder
+        )
+        with open(os.path.join(processed_folder, "ER_Diagram.png"), "wb") as img_file:
             img_file.write(image_data)
 
         return jsonify({"message": "ER Diagram generated successfully"})
@@ -422,7 +456,12 @@ def api_generate_er_diagram():
 @app.route("/api/get_er_diagram_image", methods=["GET"])
 def get_er_diagram_image():
     try:
-        er_image_path = os.path.join(PROCESSED_FOLDER, "ER_Diagram.png")
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"message": "No session ID provided"}), 400
+
+        _, processed_folder = get_session_folders(session_id)
+        er_image_path = os.path.join(processed_folder, "ER_Diagram.png")
         if not os.path.exists(er_image_path):
             return jsonify({"message": "ER Diagram image not found"}), 400
         return send_file(er_image_path, mimetype="image/png")
@@ -433,7 +472,11 @@ def get_er_diagram_image():
 @app.route("/api/detected_fds", methods=["GET"])
 def api_get_detected_fds():
     try:
-        fd_file = os.path.join(PROCESSED_FOLDER, "detected_fds.json")
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"fds": []})
+        _, processed_folder = get_session_folders(session_id)
+        fd_file = os.path.join(processed_folder, "detected_fds.json")
         if not os.path.exists(fd_file):
             return jsonify({"fds": []})
         with open(fd_file, "r", encoding="utf-8") as f:
@@ -446,11 +489,15 @@ def api_get_detected_fds():
 @app.route("/api/decomposed_schemas", methods=["GET"])
 def api_get_decomposed_schemas():
     try:
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"schemas": []})
+        _, processed_folder = get_session_folders(session_id)
         schemas = []
-        for f in os.listdir(PROCESSED_FOLDER):
+        for f in os.listdir(processed_folder):
             if f.endswith(".csv") and not f.startswith("cleaned_"):
                 schema = pd.read_csv(
-                    os.path.join(PROCESSED_FOLDER, f), nrows=0
+                    os.path.join(processed_folder, f), nrows=0
                 ).columns.tolist()
                 schemas.append(schema)
         return jsonify({"schemas": schemas})
@@ -464,7 +511,6 @@ def api_dependency_preservation():
         data = request.get_json()
         original_fds = data.get("originalFDs", [])
         decomposed_schemas = data.get("decomposedSchemas", [])
-
         if not original_fds or not decomposed_schemas:
             return (
                 jsonify(
@@ -472,14 +518,11 @@ def api_dependency_preservation():
                 ),
                 400,
             )
-
         parsed_fds = [
             (frozenset(fd["lhs"]), frozenset(fd["rhs"])) for fd in original_fds
         ]
         parsed_schemas = [set(schema) for schema in decomposed_schemas]
-
         is_preserved = is_dependency_preserved(parsed_fds, parsed_schemas)
-
         message = (
             "Dependency Preservation: PASSED"
             if is_preserved
@@ -493,9 +536,14 @@ def api_dependency_preservation():
 @app.route("/api/lossless_check", methods=["POST"])
 def api_lossless_check():
     try:
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"message": "No session ID provided"}), 400
+
+        _, processed_folder = get_session_folders(session_id)
         files = [
             f
-            for f in os.listdir(PROCESSED_FOLDER)
+            for f in os.listdir(processed_folder)
             if f.endswith(".csv") and f.startswith("cleaned_")
         ]
         if not files:
@@ -504,12 +552,11 @@ def api_lossless_check():
                 400,
             )
 
-        cleaned_file_path = os.path.join(PROCESSED_FOLDER, files[0])
-        df = pd.read_csv(cleaned_file_path, encoding="utf-8")
+        df = pd.read_csv(os.path.join(processed_folder, files[0]), encoding="utf-8")
         original_attrs = set(df.columns)
 
         decomposed_schemas = []
-        for f in os.listdir(PROCESSED_FOLDER):
+        for f in os.listdir(processed_folder):
             if (
                 f.endswith(".csv")
                 and "_keys" not in f
@@ -519,7 +566,7 @@ def api_lossless_check():
                 and "_2NF" not in f
             ):
                 table_df = pd.read_csv(
-                    os.path.join(PROCESSED_FOLDER, f), encoding="utf-8"
+                    os.path.join(processed_folder, f), encoding="utf-8"
                 )
                 decomposed_schemas.append(set(table_df.columns))
 
@@ -529,20 +576,15 @@ def api_lossless_check():
                 400,
             )
 
-        fds_path = os.path.join(PROCESSED_FOLDER, "detected_fds.json")
+        fds_path = os.path.join(processed_folder, "detected_fds.json")
         if not os.path.exists(fds_path):
             return jsonify({"message": "Functional Dependencies not found"}), 400
 
         with open(fds_path, "r", encoding="utf-8") as f:
             raw_fds = [(frozenset(lhs), frozenset(rhs)) for lhs, rhs in json.load(f)]
 
-        is_lossless = is_lossless_decomposition(
-            original_attrs, decomposed_schemas, raw_fds
-        )
-
-        message = "Lossless Decomposition: PASSED"
-        return jsonify({"message": message})
-
+        is_lossless_decomposition(original_attrs, decomposed_schemas, raw_fds)
+        return jsonify({"message": "Lossless Decomposition: PASSED"})
     except Exception as e:
         return jsonify({"message": f"Error in Lossless Check: {str(e)}"}), 500
 
@@ -565,8 +607,7 @@ def api_get_code(step_name):
             with open(
                 os.path.join(CODE_FOLDER, filename), "r", encoding="utf-8"
             ) as file:
-                code_content = file.read()
-            return jsonify({"code": code_content})
+                return jsonify({"code": file.read()})
         except Exception as e:
             return jsonify({"message": str(e)}), 500
     return jsonify({"message": "Invalid step name"}), 400
@@ -575,18 +616,18 @@ def api_get_code(step_name):
 @app.route("/api/normalized_tables")
 def get_normalized_tables():
     try:
-        excluded_tables = {
-            "cleaned_sampleInformation_converted",
-            "cleaned_cleaned_cleaned_sampleInformation_converted",
-            "cleaned_cleaned_sampleInformation_converted",
-            "sampleInformation_converted",
-            "3NF_KeyTable",
-        }
-
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"tables": []})
+        _, processed_folder = get_session_folders(session_id)
+        excluded_prefixes = ("cleaned_", "1NF_", "2NF_")
+        excluded_names = {"3NF_KeyTable"}
         tables = [
             f.replace(".csv", "")
-            for f in os.listdir(PROCESSED_FOLDER)
-            if f.endswith(".csv") and f.replace(".csv", "") not in excluded_tables
+            for f in os.listdir(processed_folder)
+            if f.endswith(".csv")
+            and not any(f.startswith(p) for p in excluded_prefixes)
+            and f.replace(".csv", "") not in excluded_names
         ]
         return jsonify({"tables": tables})
     except Exception as e:
@@ -596,34 +637,14 @@ def get_normalized_tables():
 @app.route("/api/get_normalized_table/<table_name>")
 def get_normalized_table(table_name):
     try:
-        excluded_tables = {
-            "cleaned_sampleInformation_converted",
-            "sampleInformation_converted",
-            "3NF_keyTable",
-        }
-
-        if table_name in excluded_tables:
-            return (
-                jsonify(
-                    {
-                        "error": f"Access to table '{table_name}' is restricted.",
-                        "name": table_name,
-                        "headers": [],
-                        "rows": [],
-                    }
-                ),
-                403,
-            )
-
+        session_id = get_session_id()
+        if not session_id:
+            return jsonify({"error": "No session ID", "headers": [], "rows": []}), 400
+        _, processed_folder = get_session_folders(session_id)
         if not table_name.endswith(".csv"):
             table_name += ".csv"
-
-        file_path = os.path.join(PROCESSED_FOLDER, table_name)
-        df = pd.read_csv(file_path)
-
-        df = df.dropna()
-        df = df.astype(str)
-
+        df = pd.read_csv(os.path.join(processed_folder, table_name))
+        df = df.dropna().astype(str)
         return jsonify(
             {
                 "name": table_name.replace(".csv", ""),
@@ -646,7 +667,6 @@ def get_normalized_table(table_name):
 
 
 if __name__ == "__main__":
-    # ✅ FIX: Use env variable for debug mode — safe for Docker production
     app.run(
         debug=os.environ.get("FLASK_DEBUG", "false").lower() == "true",
         host="0.0.0.0",

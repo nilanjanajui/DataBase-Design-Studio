@@ -1,13 +1,20 @@
 from graphviz import Digraph
 import os
 
-# ✅ FIX: Use BASE_DIR instead of os.getcwd() — safe inside Docker container
+# BASE_DIR used as fallback only
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROCESSED_FOLDER = os.path.join(BASE_DIR, "processed")
 
 
-# ✅ FIX: Function was defined TWICE — duplicate removed, kept the larger/better version
-def generate_er_diagram_from_keymap(base_name: str, keymap: dict) -> bytes:
+# ✅ processed_folder is now a parameter — supports per-session folders
+def generate_er_diagram_from_keymap(
+    base_name: str, keymap: dict, processed_folder: str = None
+) -> bytes:
+
+    # Fallback to local processed folder if not provided
+    if processed_folder is None:
+        processed_folder = os.path.join(BASE_DIR, "processed")
+    os.makedirs(processed_folder, exist_ok=True)
+
     dot = Digraph(comment="ER Diagram", format="png")
     dot.attr(rankdir="TB", splines="curved", nodesep="0.3", ranksep="0.5")
     dot.attr("graph", dpi="300")
@@ -43,11 +50,9 @@ def generate_er_diagram_from_keymap(base_name: str, keymap: dict) -> bytes:
 
     for table_name, key_info in keymap.items():
         foreign_keys = key_info.get("foreign_keys", {})
-
         for fk_attr, ref_info in foreign_keys.items():
             ref_table = ref_info.get("ref_table")
             ref_column = ref_info.get("ref_column")
-
             if ref_table in keymap:
                 pk_attrs = set(keymap[ref_table].get("primary_keys", []))
                 target_port = (
@@ -68,7 +73,8 @@ def generate_er_diagram_from_keymap(base_name: str, keymap: dict) -> bytes:
                         table_name, ref_table, color=table_border_color, fontsize="10"
                     )
 
-    temp_filepath = os.path.join(PROCESSED_FOLDER, f"{base_name}_temp")
+    # ✅ Render into session's processed folder
+    temp_filepath = os.path.join(processed_folder, f"{base_name}_temp")
     dot.render(filename=temp_filepath, cleanup=False)
 
     png_path = temp_filepath + ".png"
