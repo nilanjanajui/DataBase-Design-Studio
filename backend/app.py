@@ -38,7 +38,7 @@ CORS(
                 "http://localhost:3000",
                 "http://127.0.0.1:3000",
                 "http://localhost",
-                "https://dbms-backend.onrender.com",
+                "https://dbms-backend-nj4r.onrender.com",
                 "https://database-design-studio.netlify.app",  # ← your netlify URL
             ],
             "methods": ["GET", "POST", "PUT", "DELETE"],
